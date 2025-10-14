@@ -92,6 +92,25 @@ class ArithmeticEnvironment(object):
             max_dim = 100
             tensor_dim = 2
             self.output_encoder = encoders.SymbolicInts(1, max_dim)
+        elif self.operation == 'modular_exponentiation':
+            # inputs are in the format a,b,n
+            max_dim = 3
+            tensor_dim = 1
+            self.input_encoder = encoders.NumberArray(params, max_dim, 'V', tensor_dim)
+            self.output_encoder = encoders.PositionalInts(params.base)
+        elif self.operation == 'legendre':
+            # inputs are in the format a,b,p
+            max_dim = 3
+            tensor_dim = 1
+            self.input_encoder = encoders.NumberArray(params, max_dim, 'V', tensor_dim)
+            self.output_encoder = encoders.SymbolicInts(-1, 1, '')
+        elif self.operation == 'discrete_logarithm':
+            # inputs are in the format a, b, n
+            # should return log_a(b) in Z/nZ
+            max_dim = 3
+            tensor_dim = 1
+            self.input_encoder = encoders.NumberArray(params, max_dim, 'V', tensor_dim)
+            self.output_encoder = encoders.PositionalInts(params.base)
         else:
             dims = []
             max_dim =  4 if self.operation in ["fraction_compare", "fraction_determinant", "fraction_add", "fraction_product"] else 2
