@@ -4,6 +4,8 @@ from typing import List, Tuple, Dict
 
 # ---------------- Sanitize helpers ----------------
 SPACE = " "
+SMALL_PRIMES = [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+
 
 def tok(s: str) -> str:
     # Force plain ASCII spaces and strip weird whitespace (NBSP, CR, etc.)
@@ -55,6 +57,10 @@ def _enc_ec_src(coeffs: Tuple[int,int,int,int,int], base_in: int) -> str:
         toks += _tok_int_positional(v, base_in)
     return join(toks)
 
+def _enc_legendre_src(a: int, p: int, base_in: int) -> str:
+    return join(_tok_int_positional(a, base_in) +
+                _tok_int_positional(p, base_in))
+
 # ---------------- Oracles ----------------
 def _gcd(a: int, b: int) -> int:
     a, b = abs(a), abs(b)
@@ -65,6 +71,27 @@ def _gcd(a: int, b: int) -> int:
 def _modexp(a: int, b: int, n: int) -> int:
     b = max(0, b)
     return pow(a % n, b, n)
+
+def _legendre(a: int, p: int) -> int:
+    answer = pow(a % p, (p - 1) // 2, p)
+    if answer == p-1:
+        return -1
+    return answer   
+
+def _log_mod_prime(a: int, b: int, p: int) -> int:
+    """
+    Find x such that a^x = b mod p, where p is prime.
+    Return -1 if no such x exists. (Brute force; only for small p.)
+    """
+    a = a % p; b = b % p
+    if b == 1:
+        return 0
+    cur = a
+    for x in range(1, p):
+        if cur == b:
+            return x
+        cur = (cur * a) % p
+    return -1
 
 # ---------------- Robustness transforms (SPR) ----------------
 def rw_gcd_comm(a,b): return (b,a), "COMM"
@@ -77,6 +104,9 @@ def rw_modexp_pow_factor(a,b,n,k):
     assert k >= 2 and (b % k == 0)
     a_prime = pow(a % n, k, n)
     return (a_prime, b // k, n), f"POW_FACTOR(k={k})"
+
+def rw_legendre_add(a,p,k): return (a + k*p, p), f"ADD(k={k})"
+def rw_legendre_mul_ps(a,p,k): return (a * pow(k,2,p), p), f"MUL_PS(k={k})"
 
 # ---------------- IO ----------------
 def _write_lines(path: str, lines: List[str]):
@@ -163,6 +193,28 @@ def gen_groups_ec_rank_from_csv(pairs_csv, base_in, base_out, seed, unsigned_tar
             gid_ctr += 1
     return groups
 
+def gen_groups_legendre(num_groups, base_in, base_out, a_min, a_max, p_min, p_max, rewrites_per, k_choices, seed, unsigned_targets):
+    rng = random.Random(seed)
+    groups = []
+    enc_tgt = (lambda y: _enc_scalar_unsigned(y)) if unsigned_targets else (lambda y: _enc_scalar_signed(y, base_out))
+    for gid in range(num_groups):
+        a = rng.randint(a_min, a_max)
+        # Ensure p is an odd prime
+        p = rng.choice([p for p in SMALL_PRIMES if p_min <= p <= p_max])
+        y = _legendre(a,p); label = enc_tgt(y)
+        variants = [("ORIG", _enc_legendre_src(a,p,base_in), label)]
+        for _ in range(rewrites_per):
+            if rng.random() < 0.5:
+                k = rng.choice(k_choices)
+                (aa,pp), nm = rw_legendre_add(a,p,k)
+                variants.append((nm, _enc_legendre_src(aa,pp,base_in), label))
+            else:
+                k = rng.choice([kk for kk in k_choices if kk % p != 0])
+                (aa,pp), nm = rw_legendre_mul_ps(a,p,k)
+                variants.append((nm, _enc_legendre_src(aa,pp,base_in), label))
+        groups.append((f"legendre-{gid}", variants))
+    return groups
+
 # ---------------- Emit ----------------
 def _emit(task: str, groups, out_dir: str, train_frac: float, valid_frac: float, sep: str):
     task_dir = os.path.join(out_dir, task); os.makedirs(task_dir, exist_ok=True)
@@ -195,7 +247,7 @@ def _emit(task: str, groups, out_dir: str, train_frac: float, valid_frac: float,
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", choices=["gcd","modexp","ec_rank"], required=True)
+    ap.add_argument("--task", choices=["gcd","modexp","ec_rank", "legendre"], required=True)
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--seed", type=int, default=1337)
 
@@ -231,6 +283,12 @@ def main():
     elif args.task == "modexp":
         groups = gen_groups_modexp(args.num_groups, args.base_in, args.base_out,
                                    args.a_min, args.a_max, args.b_min, args.b_max, args.n_min, args.n_max,
+                                   args.rewrites_per, args.k_choices, args.seed,
+                                   args.unsigned_targets == True)
+        
+    elif args.task == "legendre":
+        groups = gen_groups_legendre(args.num_groups, args.base_in, args.base_out,
+                                   args.a_min, args.a_max, args.n_min, args.n_max,
                                    args.rewrites_per, args.k_choices, args.seed,
                                    args.unsigned_targets == True)
     else:
