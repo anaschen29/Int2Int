@@ -20,7 +20,7 @@ from src.model import check_model_params, build_modules
 from src.envs import ENVS, build_env
 from src.trainer import Trainer
 from src.evaluator import Evaluator
-
+from src.metadata_eval import evaluate_with_metadata
 
 np.seterr(all='raise')
 
@@ -256,6 +256,8 @@ def get_parser():
     parser.add_argument("--debug", help="Enable all debug flags",
                         action="store_true")
 
+    # new things we did
+    parser.add_argument("--metadata_path", type = str, help = "path to metadata")
     
     return parser
 
@@ -285,6 +287,15 @@ def main(params):
     # evaluation
     if params.eval_only:
         scores = evaluator.run_all_evals()
+        if params.metadata_path:  # only run if metadata_path was provided
+            evaluate_with_metadata(
+                modules=trainer.modules,
+                env=env,
+                params=params,
+                epoch=trainer.epoch,
+                metadata_path=params.metadata_path,
+                output_dir=params.dump_path  # optional; defaults to params.dump_path
+            )
         for k, v in scores.items():
             logger.info("%s -> %.6f" % (k, v))
         logger.info("__log__:%s" % json.dumps(scores))
