@@ -97,12 +97,13 @@ class Evaluator(object):
             scores["total"] = self.trainer.total_samples
             return scores
         
+        # data_type_list = ["valid"]
         data_type_list = ["valid"]
-        if params.eval_data != '':
-            l = len(params.eval_data.split(','))
-            for i in range(l):
-                data_type_list.append("test"+(str(i+1) if i>0 else ""))
-
+        if params.eval_data != "":
+            paths = params.eval_data.split(",")
+            # for each extra path after the first (the first is valid), append test, test1, test2…
+            for i in range(1, len(paths)):
+                data_type_list.append("test" + ("" if i == 1 else str(i - 1)))
         with torch.no_grad():
             for data_type in data_type_list:
                 for task in params.tasks:

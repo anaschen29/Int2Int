@@ -26,6 +26,7 @@ def check_model_params(params):
 
     # reload a pretrained model
     if params.reload_model != "":
+        print(params.reload_model)
         assert os.path.isfile(params.reload_model)
 
 

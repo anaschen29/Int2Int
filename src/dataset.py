@@ -55,6 +55,7 @@ class EnvDataset(Dataset):
 
         # generation, or reloading from file
         if path is not None:
+            print("looking at", path)
             assert os.path.isfile(path)
             if params.batch_load and self.train:
                 self.load_chunk()

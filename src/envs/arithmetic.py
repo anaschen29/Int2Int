@@ -255,7 +255,8 @@ class ArithmeticEnvironment(object):
         elif data_type == "test":
             path_iter = data_path[1]
         else: 
-            path_iter = data_path[int(data_type[4:])]
+            idx = 1 + int(data_type[4:])
+            path_iter = data_path[idx]
         dataset = EnvDataset(
             self,
             task,

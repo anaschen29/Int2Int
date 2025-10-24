@@ -101,6 +101,15 @@ class Sequence(Generator):
             if check_rank != rank:
                 return None
             return input, rank
+        
+        # if self.operation == "modular_exponentiation":
+        #      # takes the values (a,b,n, a^b mod n)
+        #     inp = self.integer_sequence(4, rng)
+    
+        #     return inp, inp[3]
+        
+        
+
 
         return None
 
