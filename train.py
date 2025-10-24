@@ -358,8 +358,10 @@ if __name__ == '__main__':
 
         params.eval_only = True
         params.reload_model = params.eval_from_exp + '/best-' + params.validation_metrics + '.pth'
+        print("we're hoping to find sth at params reload at", params.reload_model)
         if not os.path.isfile(params.reload_model):
             params.reload_model = params.eval_from_exp + '/checkpoint.pth'
+            print("params reload are", params.reload_model)
         params.eval_size = None
         params.train_data = ""
         params.is_slurm_job = False
