@@ -8,7 +8,7 @@ Each CSV in <RESULTS_DIR> (e.g. labels_10.csv) should contain:
     row_id,group_id,task,rewrite,label,prediction
 """
 
-
+import argparse
 import sys
 import os
 import glob
@@ -71,19 +71,24 @@ def compute_accuracy(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python analyze_labels.py <RESULTS_DIR>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Analyze label prediction CSV files.")
+    parser.add_argument("results_dir", help="Directory containing labels_*.csv files.")
+    parser.add_argument(
+        "--pattern",
+        default="labels_*.csv",
+        help="Filename pattern to search for (default: labels_*.csv)",
+    )
+    args = parser.parse_args()
 
-    results_dir = sys.argv[1].rstrip("/")
-    csv_paths = sorted(glob.glob(os.path.join(results_dir, "labels_*.csv")))
+    results_dir = args.results_dir.rstrip("/")
+    csv_paths = sorted(glob.glob(os.path.join(results_dir, args.pattern)))
 
     if not csv_paths:
-        print(f"No labels_*.csv files found in {results_dir}")
-        sys.exit(1)
+        print(f"No {args.pattern} files found in {results_dir}")
+        return
 
     for path in csv_paths:
-        print("=" * 80)
+        print("-" * 80)
         print(f"Analyzing {os.path.basename(path)}")
         df = pd.read_csv(path)
         acc_rewrite, acc_group, sym_group = compute_accuracy(df)
@@ -91,23 +96,27 @@ def main():
         epoch = os.path.splitext(os.path.basename(path))[0].split("_")[-1]
         out_path = os.path.join(results_dir, f"summary_{epoch}.csv")
 
-        summary_parts = []
-        if not acc_rewrite.empty:
-            acc_rewrite["type"] = "rewrite"
-            summary_parts.append(acc_rewrite)
-        if not acc_group.empty:
-            acc_group["type"] = "group_acc"
-            summary_parts.append(acc_group)
-        if not sym_group.empty:
-            sym_group["type"] = "symmetry"
-            summary_parts.append(sym_group)
+        # ---- Sectioned output with group averages ----
+        with open(out_path, "w", encoding="utf-8") as f:
+            if not acc_rewrite.empty:
+                f.write("# Accuracy per rewrite\n")
+                acc_rewrite.to_csv(f, index=False)
+                f.write("\n")
 
-        if summary_parts:
-            pd.concat(summary_parts).to_csv(out_path, index=False)
-            print(f"Saved {out_path}\n")
-        else:
-            print("No rewrite, group, or symmetry columns found; summary not saved.\n")
+            if not acc_group.empty:
+                f.write("# Accuracy per group\n")
+                acc_group.to_csv(f, index=False)
+                avg_acc = acc_group["correct"].mean()
+                f.write(f"\n# Group average accuracy,{avg_acc:.4f}\n\n")
 
+            if not sym_group.empty:
+                f.write("# Symmetry metrics\n")
+                sym_group.to_csv(f, index=False)
+                avg_inv = sym_group["inv_unique_preds"].mean()
+                avg_mode = sym_group["mode_ratio"].mean()
+                f.write(f"\n# Group average symmetry,inv_unique_avg={avg_inv:.4f},mode_ratio_avg={avg_mode:.4f}\n")
+
+        print(f"Saved {out_path}\n")
 
 
 

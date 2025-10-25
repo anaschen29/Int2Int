@@ -1,0 +1,25 @@
+# Accuracy per rewrite
+rewrite,correct
+BEZ_a(k=3),1.0
+BEZ_b(k=-1),1.0
+BEZ_b(k=-2),0.0
+BEZ_b(k=-3),1.0
+BEZ_b(k=1),1.0
+BEZ_b(k=2),0.5
+COMM,1.0
+ORIG,1.0
+SIGN,0.0
+
+# Accuracy per group
+group_id,correct
+gcd-217242,0.7142857142857143
+gcd-22593,0.8333333333333334
+
+# Group average accuracy,0.7738
+
+# Symmetry metrics
+group_id,inv_unique_preds,mode_ratio
+gcd-217242,0.5,0.7142857142857143
+gcd-22593,0.5,0.8333333333333334
+
+# Group average symmetry,inv_unique_avg=0.5000,mode_ratio_avg=0.7738
