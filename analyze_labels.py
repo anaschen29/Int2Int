@@ -1,124 +1,187 @@
 #!/usr/bin/env python3
 """
-Analyze label prediction CSV files to compute accuracy metrics. 
-Usage:
-    python analyze_labels.py <RESULTS_DIR>
+Analyze label prediction CSV files to compute accuracy metrics (machine-readable outputs).
 
-Each CSV in <RESULTS_DIR> (e.g. labels_10.csv) should contain:
-    row_id,group_id,task,rewrite,label,prediction
+Usage:
+    python analyze_labels.py <RESULTS_DIR> [--pattern labels_*.csv] [--no-aggregates]
+
+Outputs per epoch (E):
+  - summary_E_overview.csv              (total, correct, overall_accuracy)
+  - summary_E_accuracy_rewrite.csv      (rewrite, accuracy)                [if rewrite present]
+  - summary_E_accuracy_group.csv        (group_id, accuracy + __AVG__)     [if group_id present]
+  - summary_E_symmetry_group.csv        (group_id, inv_unique_preds, mode_ratio + __AVG__) [if group_id present]
+
+Also writes all-epochs aggregates when >1 input unless --no-aggregates is set:
+  - all_overview.csv
+  - all_accuracy_rewrite.csv
+  - all_accuracy_group.csv
+  - all_symmetry_group.csv
 """
 
 import argparse
-import sys
 import os
 import glob
 import pandas as pd
 
-def compute_accuracy(df: pd.DataFrame) -> pd.DataFrame:
+def _safe_round(series, ndigits=4):
+    return series.astype(float).round(ndigits)
+
+def compute_tables(df: pd.DataFrame):
+    """Return four DataFrames: overview, per-rewrite, per-group acc, per-group symmetry."""
     # sanity check
     if not {"label", "prediction"}.issubset(df.columns):
         raise ValueError("CSV must contain 'label' and 'prediction' columns.")
 
+    df = df.copy()
     # normalize whitespace
     df["label"] = df["label"].astype(str).str.strip()
     df["prediction"] = df["prediction"].astype(str).str.strip()
     df["correct"] = (df["label"] == df["prediction"])
 
-    overall_acc = df["correct"].mean()
-    print(f"Overall accuracy: {overall_acc:.2%} ({df['correct'].sum()}/{len(df)})")
+    total = len(df)
+    correct = int(df["correct"].sum())
+    overall_acc = correct / total if total else float("nan")
+    overview = pd.DataFrame([{
+        "total": total,
+        "correct": correct,
+        "overall_accuracy": round(overall_acc, 4)
+    }])
 
-    # Accuracy per rewrite (if available, idk if it makes much sense)
+    # per-rewrite
     if "rewrite" in df.columns:
-        acc_rewrite = df.groupby("rewrite")["correct"].mean().reset_index()
-        print("\nAccuracy per rewrite:")
-        print(acc_rewrite)
+        acc_rewrite = (df.groupby("rewrite", dropna=False)["correct"]
+                         .mean()
+                         .reset_index()
+                         .rename(columns={"correct": "accuracy"}))
+        acc_rewrite["accuracy"] = _safe_round(acc_rewrite["accuracy"])
+        acc_rewrite = acc_rewrite.sort_values(["rewrite"]).reset_index(drop=True)
     else:
-        acc_rewrite = pd.DataFrame()
+        acc_rewrite = pd.DataFrame(columns=["rewrite", "accuracy"])
 
-    # Accuracy per group (if available)
+    # per-group + symmetry
     if "group_id" in df.columns:
-        acc_group = df.groupby("group_id")["correct"].mean().reset_index()
-        print(f"\n{len(acc_group)} groups found. Example:")
-        print(acc_group.head())
-    else:
-        acc_group = pd.DataFrame()
+        acc_group = (df.groupby("group_id", dropna=False)["correct"]
+                       .mean()
+                       .reset_index()
+                       .rename(columns={"correct": "accuracy"}))
+        acc_group["accuracy"] = _safe_round(acc_group["accuracy"])
+        acc_group = acc_group.sort_values(["group_id"]).reset_index(drop=True)
 
-    # --- Symmetry metrics ---
-    if "group_id" in df.columns:
+        # symmetry metrics
         def group_symmetry(subdf):
+            n = len(subdf)
+            if n == 0:
+                return pd.Series({"inv_unique_preds": 0.0, "mode_ratio": 0.0})
             preds = subdf["prediction"].tolist()
             unique_preds = len(set(preds))
-            inv_unique = 1.0 / unique_preds
+            inv_unique = 1.0 / unique_preds if unique_preds > 0 else 0.0
             mode_count = subdf["prediction"].value_counts().max()
-            mode_ratio = mode_count / len(subdf)
-            return pd.Series({
-                "inv_unique_preds": inv_unique,
-                "mode_ratio": mode_ratio
-            })
+            mode_ratio = mode_count / n
+            return pd.Series({"inv_unique_preds": inv_unique, "mode_ratio": mode_ratio})
 
-        sym_group = (
-            df.groupby("group_id", group_keys=False)[["prediction"]]
-            .apply(group_symmetry)
-            .reset_index()
-        )
-        print(f"\nSymmetry metrics per group (examples):")
-        print(sym_group.head())
+        sym_group = (df.groupby("group_id", dropna=False)[["prediction"]]
+                       .apply(group_symmetry)
+                       .reset_index())
+        sym_group["inv_unique_preds"] = _safe_round(sym_group["inv_unique_preds"])
+        sym_group["mode_ratio"] = _safe_round(sym_group["mode_ratio"])
+        sym_group = sym_group.sort_values(["group_id"]).reset_index(drop=True)
     else:
-        sym_group = pd.DataFrame()
+        acc_group = pd.DataFrame(columns=["group_id", "accuracy"])
+        sym_group = pd.DataFrame(columns=["group_id", "inv_unique_preds", "mode_ratio"])
 
-    # return all summaries
-    return acc_rewrite, acc_group, sym_group
+    # add AVG rows (easy to parse, no comments)
+    if not acc_group.empty:
+        acc_group = pd.concat(
+            [acc_group,
+             pd.DataFrame([{"group_id": "__AVG__", "accuracy": round(acc_group["accuracy"].mean(), 4)}])],
+            ignore_index=True
+        )
+    if not sym_group.empty:
+        sym_group = pd.concat(
+            [sym_group,
+             pd.DataFrame([{
+                 "group_id": "__AVG__",
+                 "inv_unique_preds": round(sym_group["inv_unique_preds"].mean(), 4),
+                 "mode_ratio": round(sym_group["mode_ratio"].mean(), 4),
+             }])],
+            ignore_index=True
+        )
 
+    return overview, acc_rewrite, acc_group, sym_group
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze label prediction CSV files.")
+    parser = argparse.ArgumentParser(description="Analyze label prediction CSV files (machine-readable outputs).")
     parser.add_argument("results_dir", help="Directory containing labels_*.csv files.")
-    parser.add_argument(
-        "--pattern",
-        default="labels_*.csv",
-        help="Filename pattern to search for (default: labels_*.csv)",
-    )
+    parser.add_argument("--pattern", default="labels_*.csv",
+                        help="Filename pattern to search for (default: labels_*.csv)")
+    parser.add_argument("--no-aggregates", action="store_true",
+                        help="Do not write all-epochs aggregate CSVs.")
     args = parser.parse_args()
 
     results_dir = args.results_dir.rstrip("/")
     csv_paths = sorted(glob.glob(os.path.join(results_dir, args.pattern)))
-
     if not csv_paths:
         print(f"No {args.pattern} files found in {results_dir}")
         return
 
+    # holders for all-epochs aggregates
+    agg_overview = []
+    agg_rewrite = []
+    agg_group = []
+    agg_sym = []
+
     for path in csv_paths:
+        fname = os.path.basename(path)
+        # epoch = trailing token after last underscore (fallback to full stem)
+        stem = os.path.splitext(fname)[0]
+        parts = stem.split("_")
+        epoch = parts[-1] if len(parts) > 1 else stem
+
         print("-" * 80)
-        print(f"Analyzing {os.path.basename(path)}")
+        print(f"Analyzing {fname} (epoch={epoch})")
+
         df = pd.read_csv(path)
-        acc_rewrite, acc_group, sym_group = compute_accuracy(df)
+        overview, acc_rewrite, acc_group, sym_group = compute_tables(df)
 
-        epoch = os.path.splitext(os.path.basename(path))[0].split("_")[-1]
-        out_path = os.path.join(results_dir, f"summary_{epoch}.csv")
+        # per-epoch outputs (pure CSVs, one table per file)
+        pd.options.display.float_format = "{:0.4f}".format  # for any printouts (doesn't affect CSV types)
+        base = os.path.join(results_dir, f"summary_{epoch}")
 
-        # ---- Sectioned output with group averages ----
-        with open(out_path, "w", encoding="utf-8") as f:
-            if not acc_rewrite.empty:
-                f.write("# Accuracy per rewrite\n")
-                acc_rewrite.to_csv(f, index=False)
-                f.write("\n")
+        overview.to_csv(base + "_overview.csv", index=False)
+        if not acc_rewrite.empty:
+            acc_rewrite.to_csv(base + "_accuracy_rewrite.csv", index=False)
+        if not acc_group.empty:
+            acc_group.to_csv(base + "_accuracy_group.csv", index=False)
+        if not sym_group.empty:
+            sym_group.to_csv(base + "_symmetry_group.csv", index=False)
 
-            if not acc_group.empty:
-                f.write("# Accuracy per group\n")
-                acc_group.to_csv(f, index=False)
-                avg_acc = acc_group["correct"].mean()
-                f.write(f"\n# Group average accuracy,{avg_acc:.4f}\n\n")
+        print(f"Saved summary CSVs for epoch {epoch}")
 
-            if not sym_group.empty:
-                f.write("# Symmetry metrics\n")
-                sym_group.to_csv(f, index=False)
-                avg_inv = sym_group["inv_unique_preds"].mean()
-                avg_mode = sym_group["mode_ratio"].mean()
-                f.write(f"\n# Group average symmetry,inv_unique_avg={avg_inv:.4f},mode_ratio_avg={avg_mode:.4f}\n")
+        # stash for aggregates
+        o = overview.copy(); o.insert(0, "epoch", epoch); agg_overview.append(o)
+        if not acc_rewrite.empty:
+            r = acc_rewrite.copy(); r.insert(0, "epoch", epoch); agg_rewrite.append(r)
+        if not acc_group.empty:
+            g = acc_group.copy(); g.insert(0, "epoch", epoch); agg_group.append(g)
+        if not sym_group.empty:
+            s = sym_group.copy(); s.insert(0, "epoch", epoch); agg_sym.append(s)
 
-        print(f"Saved {out_path}\n")
-
-
+    # all-epochs aggregates (unless disabled or only one file)
+    multiple = len(csv_paths) > 1
+    if multiple and not args.no-aggregates:
+        if agg_overview:
+            pd.concat(agg_overview, ignore_index=True) \
+              .sort_values(["epoch"]).to_csv(os.path.join(results_dir, "all_overview.csv"), index=False)
+        if agg_rewrite:
+            pd.concat(agg_rewrite, ignore_index=True) \
+              .sort_values(["epoch", "rewrite"]).to_csv(os.path.join(results_dir, "all_accuracy_rewrite.csv"), index=False)
+        if agg_group:
+            pd.concat(agg_group, ignore_index=True) \
+              .sort_values(["epoch", "group_id"]).to_csv(os.path.join(results_dir, "all_accuracy_group.csv"), index=False)
+        if agg_sym:
+            pd.concat(agg_sym, ignore_index=True) \
+              .sort_values(["epoch", "group_id"]).to_csv(os.path.join(results_dir, "all_symmetry_group.csv"), index=False)
+        print("Saved all-epochs aggregate CSVs")
 
 if __name__ == "__main__":
     main()
