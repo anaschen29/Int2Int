@@ -15,7 +15,8 @@ def evaluate_with_metadata(
 ) -> pd.DataFrame:
     """
     Evaluate using the Int2Int encoder/decoder API faithfully, then join with metadata.
-    Produces labels_{epoch}.csv with columns from metadata plus 'prediction'.
+    Produces <output_dir>/<split>/labels_{epoch}.csv with metadata columns + 'prediction'.
+    Matching is done on a whitespace-normalized 'input' key to be robust to spacing.
     """
 
     # ---------- IO setup ----------
@@ -23,11 +24,19 @@ def evaluate_with_metadata(
         output_dir = params.dump_path
     os.makedirs(output_dir, exist_ok=True)
 
+    # ---------- Metadata load & canonical key ----------
+    def canon(s: str) -> str:
+        # collapse any whitespace runs to single spaces and strip ends
+        # (safe because your data is already sign/digit tokens with spaces)
+        return " ".join(str(s).split())
+
     meta_df = pd.read_csv(metadata_path)
     if "input" not in meta_df.columns:
         raise ValueError("metadata CSV must contain an 'input' column.")
-    # speed up lookup
-    meta_map = meta_df.set_index("input")
+    meta_df["_key"] = meta_df["input"].apply(canon)
+    meta_map = meta_df.set_index("_key")
+    # quick visibility
+    print(f"[metadata_eval] loaded metadata rows={len(meta_df)} cols={list(meta_df.columns)}", flush=True)
 
     # ---------- Model handles ----------
     arch = params.architecture
@@ -40,13 +49,11 @@ def evaluate_with_metadata(
     if is_multi_gpu and decoder is not None:
         decoder = decoder.module
 
-    # ---------- Eval data paths ----------
+    # ---------- Eval data paths (splits) ----------
     if getattr(params, "eval_data", ""):
-        data_paths = params.eval_data.split(",")
+        data_paths = [p for p in params.eval_data.split(",") if p]
     else:
         data_paths = [None]
-
-    results: List[Dict[str, Any]] = []
 
     # small helpers
     def tokens_to_str(ids: List[int]) -> str:
@@ -62,21 +69,32 @@ def evaluate_with_metadata(
     max_len = int(getattr(params, "max_output_len", 128))
     if max_len <= 0:
         max_len = 128
-    # allow for BOS/EOS positions
-    max_len = max_len + 2
+    max_len = max_len + 2  # allow BOS/EOS
 
-    # ---------- Iterate over datasets / tasks ----------
+    # ---------- Tasks list ----------
     if isinstance(params.tasks, (list, tuple)):
         task_list = list(params.tasks)
     else:
         task_list = [t for t in str(params.tasks).split(",") if t]
 
+    all_results: List[Dict[str, Any]] = []  # aggregated over all splits (also return)
+
     for data_path in data_paths:
+        split_name = os.path.basename(data_path) if data_path else "unknown"
+        split_dir = os.path.join(output_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        print(f"[metadata_eval] evaluating split={split_name} -> out={split_dir}", flush=True)
+
+        results: List[Dict[str, Any]] = []
+        total_seen = 0
+        matched = 0
+        skipped = 0
+
         path_list = [data_path] if data_path is not None else None
 
         for task in task_list:
             iterator = env.create_test_iterator(
-                data_type="valid",
+                data_type="valid",            # evaluation mode
                 task=task,
                 data_path=path_list,
                 batch_size=params.batch_size_eval,
@@ -84,7 +102,7 @@ def evaluate_with_metadata(
                 size=params.eval_size,
             )
 
-            # Put modules into eval mode
+            # eval mode
             if encoder is not None:
                 encoder.eval()
             if decoder is not None:
@@ -92,28 +110,25 @@ def evaluate_with_metadata(
 
             with torch.no_grad():
                 for (x1, len1), (x2, len2), _ in iterator:
-                    # Send to CUDA if needed
+                    # to CUDA if available
                     if torch.cuda.is_available() and not getattr(params, "cpu", False):
                         x1, len1 = x1.cuda(non_blocking=True), len1.cuda(non_blocking=True)
 
                     bs = len1.size(0)
 
-                    # ---------- Reconstruct input string exactly like in files (no trailing EOS) ----------
+                    # ---------- Reconstruct inputs (drop trailing EOS) ----------
                     inp_strs: List[str] = []
                     for i in range(bs):
-                        L = int(len1[i].item())  # includes EOS the collator added
-                        use_L = max(0, L - 1)    # drop trailing EOS to match file/CSV
+                        L = int(len1[i].item())    # includes EOS added by collator
+                        use_L = max(0, L - 1)      # drop trailing EOS to match file/CSV
                         ids = x1[:use_L, i].detach().cpu().tolist()
-                        # defensively drop any specials (rare)
-                        ids = [t for t in ids if t not in SPECIAL]
+                        ids = [t for t in ids if t not in SPECIAL]  # defensive
                         inp_strs.append(tokens_to_str(ids))
 
-                    # ---------- Generate predictions per architecture ----------
+                    # ---------- Generate predictions ----------
                     pred_strs: List[str] = [""] * bs
 
                     if arch == "encoder_decoder":
-                        # 1) Encode with correct API
-                        # encoder forward expects: encoder("fwd", x= (slen, bs), lengths=(bs), causal=False)
                         enc_states = encoder(
                             "fwd",
                             x=x1,
@@ -123,92 +138,54 @@ def evaluate_with_metadata(
                             src_len=None,
                             use_cache=False,
                         )  # (slen_src, bs, dim)
-
-                        # 2) decoder.generate expects src_enc (bs, slen_src, dim) and src_len (bs)
                         src_enc = enc_states.transpose(0, 1).contiguous()  # (bs, slen, dim)
+                        gen_tokens, gen_len = decoder.generate(src_enc, len1, max_len=max_len)  # (cur_len, bs)
 
-                        gen_tokens, gen_len = decoder.generate(
-                            src_enc, len1, max_len=max_len
-                        )  # gen_tokens: (cur_len, bs)
-
-                        # 3) Decode: sequence starts at BOS (<eos>) at pos 0; stop before first EOS
                         gen_tokens = gen_tokens.cpu()
                         for i in range(bs):
                             seq = gen_tokens[:, i].tolist()
-                            # find first EOS at position >= 1
-                            eos_pos = None
-                            for j in range(1, len(seq)):
-                                if seq[j] == env.eos_index:
-                                    eos_pos = j
-                                    break
-                            if eos_pos is None:
-                                eos_pos = len(seq)
-                            # drop BOS at [0], drop EOS; also drop specials defensively
+                            # drop BOS at 0; stop at first EOS >=1
+                            eos_pos = next((j for j in range(1, len(seq)) if seq[j] == env.eos_index), len(seq))
                             body = [t for t in seq[1:eos_pos] if t not in SPECIAL]
                             pred_strs[i] = tokens_to_str(body)
 
                     elif arch == "decoder_only":
-                        # decoder_only.generate expects the input tokens and lengths directly
-                        gen_tokens, gen_len = decoder.generate(
-                            x1, len1, max_len=max_len
-                        )  # (cur_len, bs)
-
+                        gen_tokens, gen_len = decoder.generate(x1, len1, max_len=max_len)  # (cur_len, bs)
                         gen_tokens = gen_tokens.cpu()
                         for i in range(bs):
                             seq = gen_tokens[:, i].tolist()
-                            # find <eos> after optional <sep> handling (generate handles it)
-                            eos_pos = None
-                            for j in range(1, len(seq)):
-                                if seq[j] == env.eos_index:
-                                    eos_pos = j
-                                    break
-                            if eos_pos is None:
-                                eos_pos = len(seq)
+                            eos_pos = next((j for j in range(1, len(seq)) if seq[j] == env.eos_index), len(seq))
                             body = [t for t in seq[1:eos_pos] if t not in SPECIAL]
                             pred_strs[i] = tokens_to_str(body)
 
                     elif arch == "encoder_only":
-                        # Some codepaths define an encoder.decode. If present, use it.
                         if hasattr(encoder, "decode"):
                             preds = encoder.decode(x1, len1, exp_len=max_len).cpu()  # (bs, <=max_len)
                             for i in range(bs):
                                 seq = preds[i].tolist()
-                                # stop at EOS
-                                eos_pos = None
-                                for j, t in enumerate(seq):
-                                    if t == env.eos_index:
-                                        eos_pos = j
-                                        break
-                                if eos_pos is None:
-                                    eos_pos = len(seq)
+                                eos_pos = next((j for j, t in enumerate(seq) if t == env.eos_index), len(seq))
                                 body = [t for t in seq[:eos_pos] if t not in SPECIAL]
                                 pred_strs[i] = tokens_to_str(body)
                         else:
-                            # Fallback: project last hidden state through the head (rarely used in this repo)
                             enc_states = encoder(
-                                "fwd",
-                                x=x1,
-                                lengths=len1,
-                                causal=False,
-                                src_enc=None,
-                                src_len=None,
-                                use_cache=False,
-                            )  # (slen, bs, dim)
-                            # Best-effort greedy on step 1
-                            last = enc_states[-1]  # (bs, dim)
-                            scores = encoder.proj(last)  # (bs, n_words)
+                                "fwd", x=x1, lengths=len1, causal=False, src_enc=None, src_len=None, use_cache=False
+                            )
+                            last = enc_states[-1]                   # (bs, dim)
+                            scores = encoder.proj(last)             # (bs, n_words)
                             next_words = torch.topk(scores, 1)[1].squeeze(1).cpu().tolist()
                             pred_strs = [env.id2word[w] if w not in SPECIAL else "" for w in next_words]
 
-                    # ---------- Merge with metadata ----------
+                    # ---------- Join with metadata (whitespace-normalized key) ----------
                     for i in range(bs):
-                        inp = inp_strs[i]
+                        total_seen += 1
+                        key = canon(inp_strs[i])
                         pred = pred_strs[i]
                         try:
-                            rows = meta_map.loc[inp]
+                            rows = meta_map.loc[key]
                         except KeyError:
-                            # No matching metadata row for this input; skip
+                            skipped += 1
                             continue
+                        matched += 1
                         if isinstance(rows, pd.DataFrame):
                             recs = rows.to_dict("records")
                         else:
@@ -218,6 +195,14 @@ def evaluate_with_metadata(
                             out["prediction"] = pred
                             results.append(out)
 
-    out_df = pd.DataFrame(results)
-    out_df.to_csv(os.path.join(output_dir, f"labels_{epoch}.csv"), index=False)
-    return out_df
+        # ---------- Write one CSV per split ----------
+        out_df = pd.DataFrame(results)
+        csv_path = os.path.join(split_dir, f"labels_{epoch}.csv")
+        print(f"[metadata_eval] split={split_name} total_seen={total_seen} matched={matched} skipped={skipped}", flush=True)
+        print(f"[metadata_eval] writing: {csv_path} (rows={len(out_df)})", flush=True)
+        out_df.to_csv(csv_path, index=False)
+
+        all_results.extend(results)
+
+    # Return a DataFrame aggregating all splits (if multiple)
+    return pd.DataFrame(all_results)
