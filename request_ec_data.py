@@ -1,4 +1,3 @@
-```python
 """
 Requests elliptic curve data from an LMFDB SQL mirror using lmfdb-lite. 
 
@@ -179,7 +178,8 @@ def write_split_files(outdir: str, splits: Dict[str, List[Tuple[str,int,str,str]
 def do_splits(examples: List[Tuple[str,int,str,str]]) -> Dict[str, List[Tuple[str,int,str,str]]]:
     """
     Train/valid/test/robust split.
-    Ensure TRAIN and TEST are (as much as possible) balanced between rank 0 and rank 1.
+    Ensure TRAIN and TEST are (as much as possible) balanced between rank 0 and rank 1,
+    and make sure each split is shuffled.
     """
     n = len(examples)
     n_train = int(0.40 * n)
@@ -188,9 +188,11 @@ def do_splits(examples: List[Tuple[str,int,str,str]]) -> Dict[str, List[Tuple[st
     assigned = n_train + n_valid + n_test
     n_robust = max(0, n - assigned)
 
-    # Keep original shuffle order; separate by label
+    # Separate by label and shuffle class buckets to avoid label blocks
     ex0 = [e for e in examples if e[1] == 0]
     ex1 = [e for e in examples if e[1] == 1]
+    random.shuffle(ex0)
+    random.shuffle(ex1)
 
     def take_balanced(n_take: int, ex0: List, ex1: List) -> List:
         half = n_take // 2
@@ -211,14 +213,20 @@ def do_splits(examples: List[Tuple[str,int,str,str]]) -> Dict[str, List[Tuple[st
             t = min(len(ex1), rem)
             out.extend(ex1[:t]); del ex1[:t]
 
+        random.shuffle(out)  # ensure the split itself is shuffled
         return out
 
     train = take_balanced(n_train, ex0, ex1)
     test  = take_balanced(n_test,  ex0, ex1)
 
     remaining = ex0 + ex1
+    random.shuffle(remaining)  # shuffle before slicing the rest
     valid = remaining[:n_valid]
     robust = remaining[n_valid:n_valid + n_robust]
+
+    # Extra safety: shuffle these small splits too
+    random.shuffle(valid)
+    random.shuffle(robust)
 
     return {
         "train": train,
@@ -226,6 +234,7 @@ def do_splits(examples: List[Tuple[str,int,str,str]]) -> Dict[str, List[Tuple[st
         "test":  test,
         "robust": robust,
     }
+
 
 # ---------------- Main builder -------------------------
 
@@ -301,4 +310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
