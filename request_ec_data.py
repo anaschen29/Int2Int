@@ -1,3 +1,4 @@
+```python
 """
 Requests elliptic curve data from an LMFDB SQL mirror using lmfdb-lite. 
 
@@ -16,11 +17,6 @@ Step 3: Run this script in terminal to build the dataset:
     seed and outdir are optional (default seed=1337, outdir=ec_rank_dataset).
 """
 
-
-
-
-
-
 import argparse, csv, os, random, sys, math, re
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
@@ -38,23 +34,24 @@ except Exception as e:
 
 # ---------------- Formatting helpers -------------------
 
-SPACE = " "
-
 def tok_int(n: int) -> str:
-    """Space-tokenize an integer's sign and digits: e.g., -123 -> '- 1 2 3', 0 -> '0', 81 -> '+ 8 1'."""
-    s = str(n)
-    if s[0] == '-':
-        return "- " + " ".join(s[1:])
-    elif s[0] == '+':  # shouldn't happen for ints
-        return "+ " + " ".join(s[1:])
-    else:
-        if n == 0:
-            return "0"
-        return "+ " + " ".join(s)
+    """
+    Always print an explicit sign and space-separated digits, including zero.
+    Examples:
+      -123 -> '- 1 2 3'
+       +81 -> '+ 8 1'
+        0  -> '+ 0'
+    """
+    sign = "+" if n >= 0 else "-"
+    return f"{sign} " + " ".join(str(abs(n)))
+
 
 def tok_ainvs(ainvs: List[int]) -> str:
-    """Tokenize the 5 Weierstrass coefficients [a1,a2,a3,a4,a6] like: '+ 1 + 0 + 0 + 3 + 81'."""
-    return SPACE.join(tok_int(a) for a in ainvs)
+    """
+    Tokenize the 5 Weierstrass coefficients [a1,a2,a3,a4,a6]
+    like '+ 1 + 0 + 0 + 3 + 8 1', preserving gcd-style spacing.
+    """
+    return " ".join(tok_int(a) for a in ainvs)
 
 def make_group_id(seed_label: str, counter: int) -> str:
     return f"ec-{seed_label.replace('.', '_')}-{counter}"
@@ -95,13 +92,19 @@ def isoclass_prefix(l: str) -> str:
 def isomorphic_ainvs(a1,a2,a3,a4,a6, r:int, s:int, t:int, u:int=1) -> List[int]:
     if u not in (1,-1):
         raise ValueError("This simplified transform only supports u=±1.")
-    # With u=±1, signs do not alter the integer nature; u only flips orientation; coefficients unchanged for u=-1 here.
-    a1p = a1 + 2*s
-    a2p = a2 - s*a1 + 3*r - s*s
-    a3p = a3 + r*a1 + 2*t
-    a4p = a4 - s*a3 + 2*r*a2 - (t + r*s)*a1 + 3*r*r - 2*s*t
-    a6p = a6 + r*a4 + r*r*a2 + r*r*r - t*a3 - r*t*a1 - t*t
-    return [a1p,a2p,a3p,a4p,a6p]
+    # CHANGED: incorporate u^{-k} scaling. For u=-1, only a1' and a3' flip sign.
+    a1_num = a1 + 2*s
+    a2_num = a2 - s*a1 + 3*r - s*s
+    a3_num = a3 + r*a1 + 2*t
+    a4_num = a4 - s*a3 + 2*r*a2 - (t + r*s)*a1 + 3*r*r - 2*s*t
+    a6_num = a6 + r*a4 + r*r*a2 + r*r*r - t*a3 - r*t*a1 - t*t
+
+    a1p =  a1_num if u == 1 else -a1_num   # CHANGED
+    a2p =  a2_num                           # CHANGED (u^2 = 1)
+    a3p =  a3_num if u == 1 else -a3_num   # CHANGED
+    a4p =  a4_num                           # CHANGED (u^4 = 1)
+    a6p =  a6_num                           # CHANGED (u^6 = 1)
+    return [a1p, a2p, a3p, a4p, a6p]
 
 def sample_isomorphism(ainvs: List[int]) -> Tuple[List[int], str]:
     # Small moves keep coefficients from blowing up; tune as you like.
@@ -171,26 +174,57 @@ def write_split_files(outdir: str, splits: Dict[str, List[Tuple[str,int,str,str]
                         "label": str(lab),
                     })
                     row_id += 1
-                    fout.write(f"{inp}\t{lab}\n")
+                    fout.write(f"{inp}\t{tok_int(int(lab))}\n")
 
 def do_splits(examples: List[Tuple[str,int,str,str]]) -> Dict[str, List[Tuple[str,int,str,str]]]:
     """
-    Default split: train 80%, valid 10%, test 9%, robust 1% (on total examples).
-    Examples are already shuffled.
+    Train/valid/test/robust split.
+    Ensure TRAIN and TEST are (as much as possible) balanced between rank 0 and rank 1.
     """
     n = len(examples)
-    n_train = int(0.80 * n)
-    n_valid = int(0.10 * n)
-    n_test  = int(0.09 * n)
-    # remainder to robust
+    n_train = int(0.40 * n)
+    n_valid = int(0.05 * n)
+    n_test  = int(0.05 * n)
     assigned = n_train + n_valid + n_test
     n_robust = max(0, n - assigned)
 
+    # Keep original shuffle order; separate by label
+    ex0 = [e for e in examples if e[1] == 0]
+    ex1 = [e for e in examples if e[1] == 1]
+
+    def take_balanced(n_take: int, ex0: List, ex1: List) -> List:
+        half = n_take // 2
+        out = []
+
+        t0 = min(len(ex0), half)
+        out.extend(ex0[:t0]); del ex0[:t0]
+
+        t1 = min(len(ex1), n_take - len(out))
+        out.extend(ex1[:t1]); del ex1[:t1]
+
+        # If one side was short, top up from the other
+        rem = n_take - len(out)
+        if rem > 0 and len(ex0) > 0:
+            t = min(len(ex0), rem)
+            out.extend(ex0[:t]); del ex0[:t]; rem -= t
+        if rem > 0 and len(ex1) > 0:
+            t = min(len(ex1), rem)
+            out.extend(ex1[:t]); del ex1[:t]
+
+        return out
+
+    train = take_balanced(n_train, ex0, ex1)
+    test  = take_balanced(n_test,  ex0, ex1)
+
+    remaining = ex0 + ex1
+    valid = remaining[:n_valid]
+    robust = remaining[n_valid:n_valid + n_robust]
+
     return {
-        "train": examples[:n_train],
-        "valid": examples[n_train:n_train+n_valid],
-        "test":  examples[n_train+n_valid:n_train+n_valid+n_test],
-        "robust": examples[n_train+n_valid+n_test:],
+        "train": train,
+        "valid": valid,
+        "test":  test,
+        "robust": robust,
     }
 
 # ---------------- Main builder -------------------------
@@ -218,7 +252,12 @@ def main():
 
     print(f"Fetching {N} base curves from LMFDB mirror...", flush=True)
     t0 = time.time()
-    seeds_iter = db.ec_curvedata.search({}, ["lmfdb_label","ainvs","rank"], limit=N)
+    # LIMIT CONDUCTOR TO <= 1e5
+    seeds_iter = db.ec_curvedata.search(
+        {"conductor": {"$lte": 100000}},
+        ["lmfdb_label","ainvs","rank"],
+        limit=N
+    )
     seeds = list(itertools.islice(seeds_iter, N))
     print(f"Fetched {len(seeds)} seeds in {time.time()-t0:.1f}s")
 
@@ -228,41 +267,20 @@ def main():
     def process_seed(row):
         nonlocal rew_alt
         lbl, ainvs, rank = row["lmfdb_label"], row["ainvs"], int(row["rank"])
-        if not isinstance(ainvs, list) or len(ainvs)!=5: 
+        if rank not in (0, 1):
+            return []  # CHANGED: restrict dataset to rank 0 or 1 curves only
+        if not isinstance(ainvs, list) or len(ainvs)!=5:
             return []
         gid = make_group_id(lbl, random.randint(1, 1_000_000_000))
         rows = [(tok_ainvs(ainvs), rank, gid, "ORIG")]
         k = min_k if rew_alt else max_k
         rew_alt = not rew_alt
 
-
-        # k_isg = k // 1000  # roughly 0.1% isogeny rewrites
-        # k_iso = k - k_isg
-        # for _ in range(k_iso):
-        #     new_ainvs, tag = sample_isomorphism(ainvs)
-        #     rows.append((tok_ainvs(new_ainvs), rank, gid, tag))
-        # try:
-        #     Nn, iso, num = label_from_lmfdb_label(lbl)
-        #     peers = collect_isogenous(iso_cache, Nn, iso)
-        #     others = [p for p in peers if p[0]!=lbl]
-        # except Exception:
-        #     others = []
-        # for _ in range(k_isg):
-        #     if others:
-        #         l2,a2,r2 = random.choice(others)
-        #         rows.append((tok_ainvs(a2), rank, gid, f"ISOG({l2})"))
-        #     else:
-        #         new_ainvs, tag = sample_isomorphism(ainvs)
-        #         rows.append((tok_ainvs(new_ainvs), rank, gid, tag+"|fallback"))
-
-
         # --- all rewrites are isomorphisms only (skip slow isogeny DB calls) ---
         k_iso = k      # all rewrites
         for _ in range(k_iso):
             new_ainvs, tag = sample_isomorphism(ainvs)
             rows.append((tok_ainvs(new_ainvs), rank, gid, tag))
-
-
 
         return rows
 
@@ -283,5 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
+```
